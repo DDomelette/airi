@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { SpeechProviderWithExtraOptions } from '@xsai-ext/providers/utils'
-import type { UnElevenLabsOptions } from 'unspeech'
+import type { UnAlibabaCloudOptions } from 'unspeech'
 
 import {
   SpeechPlayground,
@@ -16,7 +16,6 @@ import { useI18n } from 'vue-i18n'
 const providerId = 'alibaba-cloud-model-studio'
 const defaultModel = 'cosyvoice-v1'
 
-// Default voice settings specific to ElevenLabs
 const defaultVoiceSettings = {
   speed: 1.0,
 }
@@ -30,28 +29,22 @@ const providersStore = useProvidersStore()
 const { providers } = storeToRefs(providersStore)
 const { t } = useI18n()
 
-// Check if API key is configured
 const apiKeyConfigured = computed(() => !!providers.value[providerId]?.apiKey)
 
-// Get available voices for ElevenLabs
 const availableVoices = computed(() => {
   return speechStore.availableVoices[providerId] || []
 })
 
-// Generate speech with ElevenLabs-specific parameters
 async function handleGenerateSpeech(input: string, voiceId: string, _useSSML: boolean) {
-  const provider = await providersStore.getProviderInstance(providerId) as SpeechProviderWithExtraOptions<string, UnElevenLabsOptions>
+  const provider = await providersStore.getProviderInstance(providerId) as SpeechProviderWithExtraOptions<string, UnAlibabaCloudOptions>
   if (!provider) {
     throw new Error('Failed to initialize speech provider')
   }
 
-  // Get provider configuration
   const providerConfig = providersStore.getProviderConfig(providerId)
 
-  // Get model from configuration or use default
   const model = providerConfig.model as string | undefined || defaultModel
 
-  // ElevenLabs doesn't need SSML conversion, but if SSML is provided, use it directly
   return await speechStore.speech(
     provider,
     model,
@@ -110,10 +103,8 @@ watch(providers, async () => {
     :default-model="defaultModel"
     :additional-settings="defaultVoiceSettings"
   >
-    <!-- Voice settings specific to ElevenLabs -->
     <template #voice-settings>
       <div flex="~ col gap-4">
-        <!-- Pitch control - common to most providers -->
         <FieldRange
           v-model="pitch"
           :label="t('settings.pages.providers.provider.common.fields.field.pitch.label')"
@@ -122,7 +113,6 @@ watch(providers, async () => {
           :max="100" :step="1" :format-value="value => `${value}%`"
         />
 
-        <!-- Speed control - common to most providers -->
         <FieldRange
           v-model="speed"
           :label="t('settings.pages.providers.provider.common.fields.field.speed.label')"
@@ -131,7 +121,6 @@ watch(providers, async () => {
           :max="2.0" :step="0.01"
         />
 
-        <!-- Volume control - available in some providers -->
         <FieldRange
           v-model="volume"
           :label="t('settings.pages.providers.provider.common.fields.field.volume.label')"
@@ -142,13 +131,12 @@ watch(providers, async () => {
       </div>
     </template>
 
-    <!-- Replace the default playground with our standalone component -->
     <template #playground>
       <SpeechPlayground
         :available-voices="availableVoices"
         :generate-speech="handleGenerateSpeech"
         :api-key-configured="apiKeyConfigured"
-        default-text="Hello! This is a test of the ElevenLabs voice synthesis."
+        default-text="你好！这是一段阿里云语音合成测试。"
       />
     </template>
   </SpeechProviderSettings>
