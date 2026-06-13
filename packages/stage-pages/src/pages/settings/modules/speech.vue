@@ -177,6 +177,27 @@ watch(activeProviderVoiceConfig, (newVoice) => {
   }
 })
 
+// V3 parameter summary for volcengine
+const activeProviderConfig = computed(() => providersStore.getProviderConfig(activeSpeechProvider.value) as Record<string, unknown>)
+const v3ParamsSummary = computed(() => {
+  const cfg = activeProviderConfig.value
+  if (!cfg)
+    return null
+  const app = (cfg.app ?? {}) as Record<string, unknown>
+  const audio = ((cfg.audio ?? app.audio) ?? {}) as Record<string, unknown>
+  return {
+    resourceId: (cfg.resourceId || app.resource_id) as string,
+    format: (audio.format || 'mp3') as string,
+    sampleRate: audio.sample_rate as number,
+    bitRate: audio.bit_rate as number,
+    speechRate: audio.speech_rate as number,
+    loudnessRate: audio.loudness_rate as number,
+    pitch: audio.pitch as number,
+    emotion: audio.emotion as string,
+    emotionScale: audio.emotion_scale as number,
+  }
+})
+
 // Function to generate speech
 async function generateTestSpeech() {
   if (!testText.value.trim() && !useSSML.value)
@@ -658,6 +679,37 @@ function handleDeleteProvider(providerId: string) {
 
           <!-- Voice parameters -->
           <div flex="~ col gap-4">
+            <!-- Volcengine V3 parameter summary -->
+            <div
+              v-if="activeSpeechProvider === 'volcengine' && v3ParamsSummary"
+              border="~ neutral-200 dark:neutral-800"
+              bg="neutral-50 dark:neutral-900/50"
+              rounded-lg p-3 text-sm
+            >
+              <div flex="~ row items-center justify-between" mb-2>
+                <span font-medium text="neutral-600 dark:neutral-300">V3 参数 (只读)</span>
+                <RouterLink
+                  to="/settings/providers/speech/volcengine"
+                  text="primary-500 dark:primary-400 hover:underline"
+                  text-xs
+                >
+                  前往配置 →
+                </RouterLink>
+              </div>
+              <div grid="~ cols-2 gap-x-4 gap-y-1" text="neutral-500 dark:neutral-400">
+                <span>模型资源</span><span font-medium>{{ v3ParamsSummary.resourceId }}</span>
+                <span>格式</span><span font-medium>{{ v3ParamsSummary.format }}</span>
+                <span>采样率</span><span font-medium>{{ v3ParamsSummary.sampleRate }}</span>
+                <span>比特率</span><span font-medium>{{ v3ParamsSummary.bitRate }}</span>
+                <span>语速</span><span font-medium>{{ v3ParamsSummary.speechRate ?? 0 }}</span>
+                <span>音量</span><span font-medium>{{ v3ParamsSummary.loudnessRate ?? 0 }}</span>
+                <span>音调</span><span font-medium>{{ v3ParamsSummary.pitch ?? 0 }}</span>
+                <template v-if="v3ParamsSummary.emotion">
+                  <span>情感</span><span font-medium>{{ v3ParamsSummary.emotion }} ({{ v3ParamsSummary.emotionScale ?? 4 }})</span>
+                </template>
+              </div>
+            </div>
+
             <FieldRange
               v-model="pitch"
               label="Pitch"
