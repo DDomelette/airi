@@ -54,6 +54,7 @@ const speaker = computed({
     if (!providers.value[providerId].app)
       providers.value[providerId].app = {}
     ;(providers.value[providerId].app as Record<string, unknown>).speaker = v
+    providers.value[providerId].voice = v
   },
 })
 
@@ -142,6 +143,10 @@ async function handleGenerateSpeech(input: string, voiceId: string, _useSSML: bo
 onMounted(async () => {
   const providerConfig = providersStore.getProviderConfig(providerId)
   const providerMetadata = providersStore.getProviderMetadata(providerId)
+  // Sync voice from speaker for speech module auto-selection
+  if ((providerConfig.app as any)?.speaker && !providerConfig.voice) {
+    providerConfig.voice = (providerConfig.app as any).speaker
+  }
   if (await providerMetadata.validators.validateProviderConfig(providerConfig)) {
     await speechStore.loadVoicesForProvider(providerId)
   }
