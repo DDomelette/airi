@@ -140,6 +140,19 @@ async function handleGenerateSpeech(input: string, voiceId: string, _useSSML: bo
   )
 }
 
+function syncV3ParamsToTopLevel() {
+  if (!providers.value[providerId])
+    return
+  const cfg = providers.value[providerId]
+  const app = (cfg.app ?? {}) as Record<string, unknown>
+  if (app.resource_id)
+    cfg.resourceId = app.resource_id
+  if (app.audio)
+    cfg.audio = app.audio
+  if (app.speaker && !cfg.voice)
+    cfg.voice = app.speaker
+}
+
 onMounted(async () => {
   const providerConfig = providersStore.getProviderConfig(providerId)
   const providerMetadata = providersStore.getProviderMetadata(providerId)
@@ -147,6 +160,7 @@ onMounted(async () => {
   if ((providerConfig.app as any)?.speaker && !providerConfig.voice) {
     providerConfig.voice = (providerConfig.app as any).speaker
   }
+  syncV3ParamsToTopLevel()
   if (await providerMetadata.validators.validateProviderConfig(providerConfig)) {
     await speechStore.loadVoicesForProvider(providerId)
   }
@@ -158,6 +172,7 @@ onMounted(async () => {
 watch([providers, resourceId, speaker], async () => {
   const providerConfig = providersStore.getProviderConfig(providerId)
   const providerMetadata = providersStore.getProviderMetadata(providerId)
+  syncV3ParamsToTopLevel()
   if (await providerMetadata.validators.validateProviderConfig(providerConfig)) {
     await speechStore.loadVoicesForProvider(providerId)
   }
