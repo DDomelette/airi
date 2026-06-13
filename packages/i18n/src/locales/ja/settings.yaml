@@ -1319,7 +1319,7 @@ pages:
               description: モデルバージョンを選択してください。話者のサフィックスと一致させる必要があります
               label: モデル/リソース
             speaker:
-              description: 話者識別子（例: zh_female_meilinvyou_uranus_bigtts）
+              description: '話者識別子（例: zh_female_meilinvyou_uranus_bigtts）'
               label: 話者
             format:
               description: 音声出力形式
@@ -1340,7 +1340,7 @@ pages:
               description: 音程、-12〜12、0が標準
               label: 音程
             emotion:
-              description: 感情パラメータ（一部の話者のみ対応）、例: happy, sad, angry
+              description: '感情パラメータ（一部の話者のみ対応）、例: happy, sad, angry'
               label: 感情
             emotion_scale:
               description: 感情の強さ、1〜5、デフォルト4
