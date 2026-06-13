@@ -87,7 +87,7 @@
 
 ## OpenTelemetry
 
-初始化在 `src/libs/otel.ts`。
+初始化在 `instrumentation.ts`（NodeSDK lifecycle）+ `src/otel/index.ts`（metric handles）+ `src/otel/gauges/*.ts`（DB-backed ObservableGauge callbacks，例如 `gauges/active-sessions.ts`）。
 
 启用条件：
 
@@ -105,7 +105,7 @@
 重要实现细节：
 
 - `sdk.start()` 必须发生在 `metrics.getMeter()` 之前
-- `/health` 会被 HTTP instrumentation 忽略
+- `/livez` 和 `/readyz` 会被 HTTP instrumentation 忽略
 
 ## 运行时修改建议
 

@@ -32,6 +32,7 @@ words:
   - baichuan
   - baiducloud
   - bailian
+  - Basemove
   - bestmove
   - bigserial
   - bilibili
@@ -160,6 +161,7 @@ words:
   - lerp
   - libsamplerate
   - libsodium
+  - libuiohook
   - lightningcss
   - lipsync
   - listhen
@@ -201,6 +203,7 @@ words:
   - msvc
   - multisampling
   - Myriam
+  - napi
   - ndarray
   - Neko
   - nekomeowww
@@ -316,6 +319,7 @@ words:
   - tsdown
   - ttft
   - turborepo
+  - uiohook
   - unbird
   - unbundle
   - unconfig
@@ -343,7 +347,6 @@ words:
   - vueuse
   - waapi
   - Waifu
-  - warpdrive
   - Warudo
   - wavefile
   - webgpu

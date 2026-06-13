@@ -1,102 +1,168 @@
 using System;
-using System.IO;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Godot;
 
+/// <summary>
+/// Root node for the Godot sidecar stage runtime.
+/// </summary>
+///
+/// Call stack:
+///
+/// Godot scene tree
+///   -> <see cref="_Ready"/>
+///     -> <see cref="StageBridge.Connect"/>
+///   -> <see cref="_Process"/>
+///     -> <see cref="StageBridge.Poll"/>
+///       -> <see cref="HandleMessage"/>
 public partial class StageRoot : Node3D
 {
+    private const string AvatarRootNodeName = "AvatarRoot";
+    private const string CameraNodeName = "Camera3D";
+    private const string EditorPreviewRootNodeName = "EditorPreviewRoot";
     private const string WebSocketUrlArgumentPrefix = "--airi-ws-url=";
 
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         PropertyNameCaseInsensitive = true,
     };
 
-    private readonly WebSocketPeer _socket = new();
-
-    private Label3D _statusLabel = null!;
-    private bool _readyAnnounced;
+    private StageBridge _bridge = null!;
+    private StageSceneController _sceneController = null!;
+    private StageViewController _viewController = null!;
+    private StageCameraInputController _cameraInputController = null!;
+    private StageAvatarGlowRuntime _avatarGlowRuntime = null!;
+    private StageViewRuntime _viewRuntime = null!;
+    private string _activeSceneModelId;
     private bool _shutdownRequested;
 
+    /// <inheritdoc/>
     public override void _Ready()
     {
-        _statusLabel = CreateStatusLabel();
-        AddChild(_statusLabel);
+        HideEditorPreviewRoot();
+        StageVisualPreset.Apply(this);
+
+        var avatarRoot = ResolveAvatarRoot();
+        var camera = ResolveCamera();
+        _sceneController = new StageSceneController(avatarRoot, new VrmAvatarLoader());
+        InitializeViewRuntime(avatarRoot, camera);
+        _avatarGlowRuntime = new StageAvatarGlowRuntime(camera);
 
         var webSocketUrl = ResolveWebSocketUrl();
         if (string.IsNullOrWhiteSpace(webSocketUrl))
         {
-            UpdateStatus("Missing Electron bridge URL.");
-            GD.PushError("Godot stage missing --airi-ws-url argument.");
-            GetTree().Quit();
+            GD.PushWarning("Godot stage missing --airi-ws-url argument.");
             return;
         }
 
-        var connectError = _socket.ConnectToUrl(webSocketUrl);
+        _bridge = new StageBridge(_jsonOptions);
+        _bridge.Opened += HandleBridgeOpened;
+        _bridge.MessageReceived += HandleMessage;
+        _bridge.Closed += HandleBridgeClosed;
+
+        var connectError = _bridge.Connect(webSocketUrl);
         if (connectError != Error.Ok)
         {
-            UpdateStatus("Failed to connect to Electron main.");
-            GD.PushError($"Godot stage failed to connect to {webSocketUrl}: {connectError}.");
+            GD.PushError($"Godot stage failed to connect to Electron main: {connectError}.");
+            GetTree().Quit();
+            return;
+        }
+    }
+
+    /// <inheritdoc/>
+    public override void _Process(double delta)
+    {
+        if (_bridge == null)
+        {
+            return;
+        }
+
+        _bridge.Poll();
+        _viewRuntime?.Process(delta);
+        _cameraInputController?.Process(delta);
+    }
+
+    /// <inheritdoc/>
+    public override void _ExitTree()
+    {
+        _avatarGlowRuntime?.Dispose();
+    }
+
+    /// <inheritdoc/>
+    public override void _Input(InputEvent @event)
+    {
+        _cameraInputController?.HandleInput(@event);
+    }
+
+    private void HandleBridgeOpened()
+    {
+        _bridge.SendEnvelope("stage.ready");
+    }
+
+    private void HandleBridgeClosed(string message)
+    {
+        if (_shutdownRequested)
+        {
             GetTree().Quit();
             return;
         }
 
-        UpdateStatus("Connecting to Electron main...");
-        GD.Print($"StageRoot connecting to {webSocketUrl}");
+        GD.PushWarning(message);
+        GetTree().Quit();
     }
 
-    public override void _Process(double delta)
+    private Node3D ResolveAvatarRoot()
     {
-        _socket.Poll();
-
-        switch (_socket.GetReadyState())
+        var avatarRoot = GetNodeOrNull<Node3D>(AvatarRootNodeName);
+        if (avatarRoot != null)
         {
-            case WebSocketPeer.State.Open:
-                if (!_readyAnnounced)
-                {
-                    SendEnvelope("stage.ready");
-                    _readyAnnounced = true;
-                    UpdateStatus("Connected to Electron main.");
-                }
-
-                while (_socket.GetAvailablePacketCount() > 0)
-                {
-                    HandleMessage(_socket.GetPacket().GetStringFromUtf8());
-                }
-                break;
-            case WebSocketPeer.State.Closed:
-                if (_shutdownRequested)
-                {
-                    GetTree().Quit();
-                    return;
-                }
-
-                var message = $"Electron bridge closed ({_socket.GetCloseCode()}).";
-                UpdateStatus(message);
-                GD.PushWarning(message);
-                GetTree().Quit();
-                break;
+            return avatarRoot;
         }
+
+        avatarRoot = new Node3D
+        {
+            Name = AvatarRootNodeName,
+        };
+        AddChild(avatarRoot);
+        return avatarRoot;
     }
 
-    private Label3D CreateStatusLabel()
+    private Camera3D ResolveCamera()
     {
-        return new Label3D
+        var camera = GetNodeOrNull<Camera3D>(CameraNodeName);
+        if (camera != null)
         {
-            Billboard = BaseMaterial3D.BillboardModeEnum.Enabled,
-            FontSize = 56,
-            Modulate = new Color(0.95f, 0.98f, 1.0f),
-            PixelSize = 0.0035f,
-            Position = new Vector3(0.0f, 1.35f, 0.0f),
-            Text = "Godot Stage (experimental)",
+            return camera;
+        }
+
+        camera = new Camera3D
+        {
+            Current = true,
+            Name = CameraNodeName,
         };
+        AddChild(camera);
+        return camera;
+    }
+
+    private void HideEditorPreviewRoot()
+    {
+        var editorPreviewRoot = GetNodeOrNull<Node3D>(EditorPreviewRootNodeName);
+        if (editorPreviewRoot == null)
+        {
+            return;
+        }
+
+        editorPreviewRoot.Visible = false;
+        editorPreviewRoot.ProcessMode = ProcessModeEnum.Disabled;
     }
 
     private void HandleMessage(string rawMessage)
     {
         try
         {
-            var envelope = JsonSerializer.Deserialize<GodotEnvelope>(rawMessage, _jsonOptions);
+            var envelope = JsonSerializer.Deserialize<StageEnvelope>(rawMessage, _jsonOptions);
             if (envelope == null || string.IsNullOrWhiteSpace(envelope.Type))
             {
                 return;
@@ -107,9 +173,14 @@ public partial class StageRoot : Node3D
                 case "host.scene.apply":
                     ApplySceneInput(envelope.Payload);
                     break;
+                case "host.view.patch":
+                    ApplyViewPatch(envelope.Payload);
+                    break;
+                case "host.view.request_snapshot":
+                    RequestViewSnapshot(envelope.Payload);
+                    break;
                 case "host.shutdown":
                     _shutdownRequested = true;
-                    UpdateStatus("Shutdown requested by Electron main.");
                     GetTree().Quit();
                     break;
             }
@@ -117,11 +188,7 @@ public partial class StageRoot : Node3D
         catch (Exception error)
         {
             var message = $"Failed to parse Electron message: {error.Message}";
-            UpdateStatus(message);
-            SendEnvelope("scene.error", new
-            {
-                message,
-            });
+            SendSceneError(message);
         }
     }
 
@@ -129,24 +196,37 @@ public partial class StageRoot : Node3D
     {
         if (payloadElement == null)
         {
-            SendEnvelope("scene.error", new
-            {
-                message = "Scene input payload was empty.",
-            });
+            SendSceneError("Scene input payload was empty.");
             return;
         }
 
         try
         {
-            var payload = payloadElement.Value.Deserialize<SceneApplyPayload>(_jsonOptions);
+            var payload = payloadElement.Value.Deserialize<StageSceneApplyPayload>(_jsonOptions);
             if (payload == null)
             {
                 throw new InvalidOperationException("Scene input payload could not be parsed.");
             }
 
-            var fileName = Path.GetFileName(payload.Path);
-            UpdateStatus($"Connected to Electron main.\nModel: {payload.Name}\nAsset: {fileName}");
-            SendEnvelope("scene.applied", new
+            if (_viewRuntime?.HasViewState == true
+                && string.Equals(_activeSceneModelId, payload.ModelId, StringComparison.Ordinal))
+            {
+                _viewRuntime.EmitLoadedSnapshot();
+            }
+            else
+            {
+                // TODO:
+                // Make avatar apply and view bootstrap one transaction. Today avatar apply commits
+                // before bootstrap. If bootstrap fails, scene.error is reported with the new
+                // avatar already loaded.
+                var avatar = _sceneController.Apply(payload);
+                _viewController?.UseAvatar(avatar);
+                _avatarGlowRuntime?.UseAvatar(avatar);
+                _viewRuntime?.BootstrapForAvatar();
+                _activeSceneModelId = payload.ModelId;
+            }
+
+            _bridge.SendEnvelope("scene.applied", new
             {
                 modelId = payload.ModelId,
             });
@@ -154,52 +234,90 @@ public partial class StageRoot : Node3D
         catch (Exception error)
         {
             var message = $"Failed to apply scene input: {error.Message}";
-            UpdateStatus(message);
-            SendEnvelope("scene.error", new
-            {
-                message,
-            });
+            SendSceneError(message);
+        }
+    }
+
+    private void ApplyViewPatch(JsonElement? payloadElement)
+    {
+        if (payloadElement == null)
+        {
+            _viewRuntime?.EmitInvalidPayload("View patch payload was empty.");
+            return;
+        }
+
+        var requestId = StageViewJson.TryReadRequestId(payloadElement.Value);
+        try
+        {
+            var payload = StageViewJson.ParsePatchRequest(payloadElement.Value);
+            _viewRuntime.ApplyRemotePatch(payload);
+        }
+        catch (Exception error)
+        {
+            _viewRuntime?.EmitInvalidPayload(error.Message, requestId);
+        }
+    }
+
+    private void RequestViewSnapshot(JsonElement? payloadElement)
+    {
+        if (payloadElement == null)
+        {
+            _viewRuntime?.EmitInvalidPayload("View snapshot request payload was empty.");
+            return;
+        }
+
+        var requestId = StageViewJson.TryReadRequestId(payloadElement.Value);
+        try
+        {
+            var payload = StageViewJson.ParseSnapshotRequest(payloadElement.Value);
+            _viewRuntime.RequestSnapshot(payload);
+        }
+        catch (Exception error)
+        {
+            _viewRuntime?.EmitInvalidPayload(error.Message, requestId);
         }
     }
 
     private static string ResolveWebSocketUrl()
     {
-        foreach (var argument in OS.GetCmdlineUserArgs())
+        return ResolveArgumentValue(WebSocketUrlArgumentPrefix);
+    }
+
+    private static string ResolveArgumentValue(string prefix)
+    {
+        var arguments = OS.GetCmdlineUserArgs();
+        if (arguments.Length == 0)
         {
-            if (argument.StartsWith(WebSocketUrlArgumentPrefix, StringComparison.Ordinal))
+            arguments = OS.GetCmdlineArgs();
+        }
+
+        foreach (var argument in arguments)
+        {
+            if (argument.StartsWith(prefix, StringComparison.Ordinal))
             {
-                return argument[WebSocketUrlArgumentPrefix.Length..];
+                return argument[prefix.Length..];
             }
         }
 
         return string.Empty;
     }
 
-    private void SendEnvelope(string type, object payload = null)
+    private void InitializeViewRuntime(Node3D avatarRoot, Camera3D camera)
     {
-        if (_socket.GetReadyState() != WebSocketPeer.State.Open)
-        {
-            return;
-        }
-
-        _socket.SendText(JsonSerializer.Serialize(new
-        {
-            type,
-            payload,
-        }, _jsonOptions));
+        var cameraController = new StageCameraPoseController(camera);
+        _viewController = new StageViewController(avatarRoot, cameraController);
+        _viewRuntime = new StageViewRuntime(_viewController);
+        _viewRuntime.SnapshotReady += payload =>
+            _bridge.SendEnvelope("stage.view.snapshot", payload);
+        _viewRuntime.ErrorReady += payload => _bridge.SendEnvelope("stage.view.error", payload);
+        _cameraInputController = new StageCameraInputController(_viewRuntime, cameraController);
     }
 
-    private void UpdateStatus(string message)
+    private void SendSceneError(string message)
     {
-        _statusLabel.Text = $"Godot Stage (experimental)\n{message}";
+        _bridge.SendEnvelope("scene.error", new
+        {
+            message,
+        });
     }
-
-    private sealed record GodotEnvelope(string Type, JsonElement? Payload);
-
-    private sealed record SceneApplyPayload(
-        string ModelId,
-        string Format,
-        string Name,
-        string Path
-    );
 }

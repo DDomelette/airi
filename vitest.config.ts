@@ -5,6 +5,7 @@ export default defineConfig({
     projects: [
       'apps/server',
       'apps/ui-server-auth',
+      'apps/ui-admin',
       'apps/stage-tamagotchi',
       'packages/audio-pipelines-transcribe',
       'packages/cap-vite',
@@ -15,7 +16,6 @@ export default defineConfig({
       'packages/server-runtime',
       'packages/server-sdk',
       'packages/stage-shared',
-      'packages/vite-plugin-warpdrive',
     ],
   },
 })

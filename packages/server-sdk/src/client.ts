@@ -1,5 +1,6 @@
 import type {
-  MetadataEventSource,
+  ExtensionIdentity,
+  ExtensionModuleIdentity,
   ModuleConfigSchema,
   ModuleDependency,
   WebSocketBaseEvent,
@@ -49,10 +50,17 @@ export interface ClientOptions<C = undefined> {
   name: string
   token?: string
   websocketConstructor?: WebSocketLikeConstructor
+  /**
+   * Selects the connection handshake owned by this client.
+   *
+   * @default 'module'
+   */
+  handshake?: 'module' | 'manual'
 
   connectTimeoutMs?: number
   possibleEvents?: Array<keyof WebSocketEvents<C>>
-  identity?: MetadataEventSource
+  extension?: ExtensionIdentity
+  identity?: ExtensionModuleIdentity
   dependencies?: ModuleDependency[]
   configSchema?: ModuleConfigSchema
   heartbeat?: ClientHeartbeatOptions
@@ -122,7 +130,7 @@ export class Client<C = undefined> {
   private connectionAttempt?: ConnectionAttempt
   private failureReason?: Error
   private status: ClientStatus = 'idle'
-  private readonly identity: MetadataEventSource
+  private readonly identity: ExtensionModuleIdentity
   private readonly heartbeat: Required<ClientHeartbeatOptions>
   private readonly websocketConstructor: WebSocketLikeConstructor
 
@@ -139,10 +147,12 @@ export class Client<C = undefined> {
 
   constructor(options: ClientOptions<C>) {
     const { websocketConstructor, ...clientOptions } = options
+    const extension = options.extension ?? {
+      id: options.name,
+    }
     const identity = options.identity ?? {
-      kind: 'plugin',
-      plugin: { id: options.name },
       id: createInstanceId(),
+      extension,
     }
 
     const heartbeat = normalizeHeartbeatOptions(options.heartbeat)
@@ -162,7 +172,9 @@ export class Client<C = undefined> {
       autoConnect: true,
       autoReconnect: true,
       maxReconnectAttempts: -1,
+      handshake: 'module',
       ...clientOptions,
+      extension,
       heartbeat,
       identity,
     }
@@ -310,6 +322,7 @@ export class Client<C = undefined> {
   }
 
   private async runConnectLoop() {
+    const reconnectingFromReady = this.pendingReconnect
     this.pendingReconnect = false
 
     while (!this.shouldClose) {
@@ -317,7 +330,7 @@ export class Client<C = undefined> {
       this.transitionTo(reconnecting ? 'reconnecting' : 'connecting')
 
       try {
-        await this.connectOnce()
+        await this.connectOnce({ reconnectingFromReady })
         this.reconnectAttempts = 0
         return
       }
@@ -354,7 +367,7 @@ export class Client<C = undefined> {
     throw new Error('Client is closed')
   }
 
-  private connectOnce(): Promise<void> {
+  private connectOnce(options: { reconnectingFromReady?: boolean } = {}): Promise<void> {
     const WebSocketConstructor = this.websocketConstructor
     const ws = new WebSocketConstructor(this.opts.url)
     this.websocket = ws
@@ -396,14 +409,17 @@ export class Client<C = undefined> {
       void this.handleMessage(event)
     }
 
-    ws.onerror = (event: any) => {
+    ws.onerror = (event: unknown) => {
       clearConnectTimer()
 
       if (!isCurrentSocket()) {
         return
       }
 
-      const error = event?.error instanceof Error ? event.error : new Error('WebSocket error')
+      // Extract error from WebSocket error event which may vary in shape
+      const error = (event as any)?.error instanceof Error
+        ? (event as any).error
+        : new Error('WebSocket error')
       if (this.connectionAttempt) {
         this.handleSocketFailure(error, ws)
       }
@@ -446,6 +462,24 @@ export class Client<C = undefined> {
       }
 
       this.startHeartbeat()
+
+      if (this.opts.handshake === 'manual') {
+        if (options.reconnectingFromReady) {
+          attempt.authenticated = false
+          attempt.announced = false
+          this.reconnectAttempts = 0
+          this.transitionTo('authenticating')
+          return
+        }
+
+        attempt.authenticated = true
+        attempt.announced = true
+        this.reconnectAttempts = 0
+        this.transitionTo('ready')
+        this.resolveAttempt()
+        this.opts.onReady?.()
+        return
+      }
 
       if (this.opts.token) {
         attempt.authenticated = false
@@ -583,7 +617,7 @@ export class Client<C = undefined> {
 
   private tryAnnounce() {
     this.sendOrThrow({
-      type: 'module:announce',
+      type: 'extension:module:announce',
       data: {
         name: this.opts.name,
         identity: this.identity,
@@ -688,7 +722,34 @@ export class Client<C = undefined> {
         throw new Error('Authentication failed')
       }
 
-      case 'module:announced': {
+      case 'peer:authenticated': {
+        if (this.opts.handshake !== 'manual' || this.status !== 'authenticating' || !this.connectionAttempt) {
+          return
+        }
+
+        if (data.data.authenticated) {
+          this.connectionAttempt.authenticated = true
+          this.transitionTo('announcing')
+          return
+        }
+
+        throw new Error('Peer authentication failed')
+      }
+
+      case 'extension:announced': {
+        if (this.opts.handshake !== 'manual' || this.status !== 'announcing' || !this.connectionAttempt) {
+          return
+        }
+
+        this.connectionAttempt.announced = true
+        this.reconnectAttempts = 0
+        this.transitionTo('ready')
+        this.resolveAttempt()
+        this.opts.onReady?.()
+        return
+      }
+
+      case 'extension:module:announced': {
         if (!this.isSelfAnnouncement(data)) {
           return
         }
@@ -710,15 +771,18 @@ export class Client<C = undefined> {
 
       case 'registry:modules:sync': {
         // Fallback: If the status is stuck at 'announcing' but the sync already contains this module,
-        // it means the announce succeeded; the server simply didn't send back 'module:announced'
+        // it means the announce succeeded; the server simply didn't send back 'extension:module:announced'
         if (this.status !== 'announcing' || !this.connectionAttempt) {
           return
         }
 
-        const modules = (data.data as any)?.modules as Array<{
-          name: string
-          identity?: { id?: string }
-        }> ?? []
+        const syncData = data.data as {
+          modules?: Array<{
+            name: string
+            identity?: { id?: string }
+          }>
+        } | unknown
+        const modules = Array.isArray((syncData as any)?.modules) ? (syncData as any).modules : []
 
         const selfRegistered = modules.some(
           m => m.name === this.opts.name
@@ -748,7 +812,7 @@ export class Client<C = undefined> {
     }
   }
 
-  private isSelfAnnouncement(event: WebSocketBaseEvent<'module:announced', WebSocketEvents<C>['module:announced']>) {
+  private isSelfAnnouncement(event: WebSocketBaseEvent<'extension:module:announced', WebSocketEvents<C>['extension:module:announced']>) {
     return event.data.name === this.opts.name && event.data.identity?.id === this.identity.id
   }
 
@@ -758,8 +822,10 @@ export class Client<C = undefined> {
       return
     }
 
+    // Cast is necessary here because the Set stores callbacks from potentially different event types,
+    // but we're only calling listeners registered for this specific event type
     const results = await Promise.allSettled(
-      Array.from(listeners).map(listener => Promise.resolve(listener(data as any))),
+      Array.from(listeners).map(listener => Promise.resolve((listener as (data: WebSocketEvent<C>) => void | Promise<void>)(data))),
     )
 
     for (const result of results) {

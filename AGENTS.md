@@ -34,7 +34,6 @@ Concise but detailed reference for contributors working across the `moeru-ai/air
 - **IPC/Eventa**: Always use `@moeru/eventa` for type-safe, framework/runtime-agnostic IPC/RPC. Define contracts centrally (e.g., `apps/stage-tamagotchi/src/shared`) and follow usage patterns in `apps/stage-tamagotchi/src/main/services/electron` for main/renderer integration.
 - **Dependency Injection**: Use `injeca` for services/electron modules/plugins/frontend; see `apps/stage-tamagotchi/src/main/index.ts` for composition patterns.
 - **Build/CI/Lint**: `.github/workflows` for pipelines; `eslint.config.js` for lint rules.
-- **Bundling libs**: Use `tsdown` for new modules (see `packages/vite-plugin-warpdrive`).
 - **Styles**: UnoCSS config at `uno.config.ts`; check `apps/stage-web/src/styles` for existing animations; prefer UnoCSS over Tailwind.
 
 ## Key Path Index (what lives where)
@@ -59,8 +58,8 @@ Concise but detailed reference for contributors working across the `moeru-ai/air
 - DI examples: `apps/stage-tamagotchi/src/main/index.ts` (injeca).
 - Styles: `uno.config.ts` (UnoCSS), `apps/stage-web/src/styles` (animations/reference).
 - Build pipeline refs: `.github/workflows`; lint rules in `eslint.config.js`.
+- Documented solutions: `docs/solutions/` records past fixes and workflow learnings, organized by category with YAML frontmatter (`module`, `tags`, `problem_type`); relevant when implementing, debugging, or verifying in documented areas.
 - Tailwind/UnoCSS: prefer UnoCSS; if standardizing styles, add shortcuts/rules/plugins in `uno.config.ts`.
-- Bundling pattern: `packages/vite-plugin-warpdrive` (tsdown example).
 
 ## Commands (pnpm with filters)
 

@@ -1,5 +1,7 @@
 import type {
   DeliveryConfig,
+  ExtensionIdentity,
+  ExtensionModuleIdentity,
   MetadataEventSource,
   WebSocketBaseEvent,
   WebSocketEvent,
@@ -10,7 +12,7 @@ import type {
   RoutingPolicy,
 } from './middlewares'
 import type { ServerWsConsumerSelectionCandidate, ServerWsStickyAssignment } from './server-ws/core'
-import type { AuthenticatedPeer, Peer } from './types'
+import type { AuthenticatedPeer, Peer, RegisteredExtensionModule } from './types'
 
 import { Buffer } from 'node:buffer'
 import { timingSafeEqual } from 'node:crypto'
@@ -149,26 +151,45 @@ export function selectConsumerPeerId(options: {
 /**
  * Constant-time string comparison that prevents timing attacks (CWE-208).
  *
- * @param {string} a - the first string to compare
- * @param {string} b - the expected value (e.g., the real secret)
- * @returns {boolean} `true` if the strings are equal, `false` otherwise
+ * Compares two strings in constant time to prevent attackers from learning
+ * information about the target string through timing side-channels.
+ *
+ * Use when:
+ * - Comparing authentication tokens or secrets
+ * - Any security-sensitive string comparison
+ *
+ * Expects:
+ * - Both strings are available (no lazy evaluation)
+ *
+ * Returns:
+ * - `true` if the strings are equal, `false` otherwise
  */
 function timingSafeCompare(a: string, b: string): boolean {
   const bufA = Buffer.from(a)
   const bufB = Buffer.from(b)
-  if (bufA.length !== bufB.length) {
-    // Compare against itself to keep constant time, then return false
-    timingSafeEqual(bufA, bufA)
-    // To prevent leaking length information, we perform a dummy comparison on the
-    // expected value, making the execution time dependent on its length.
-    timingSafeEqual(bufB, bufB)
-    return false
-  }
 
-  return timingSafeEqual(bufA, bufB)
+  // Normalize attacker-controlled input to the expected length
+  // so timingSafeEqual always performs a real comparison.
+  const paddedA = Buffer.alloc(bufB.length)
+
+  bufA.copy(
+    paddedA,
+    0,
+    0,
+    Math.min(bufA.length, bufB.length),
+  )
+
+  return (
+    timingSafeEqual(paddedA, bufB)
+    && bufA.length === bufB.length
+  )
 }
 
-// helper send function
+/**
+ * Sends an event to a specific peer.
+ * Converts the event to JSON format before transmission.
+ * @internal
+ */
 function send(peer: Peer, event: WebSocketBaseEvent<string, unknown> | string) {
   peer.send(stringifyEvent(event))
 }
@@ -223,17 +244,33 @@ export function normalizeLoggerConfig(options?: AppOptions) {
 /**
  * Creates the H3 websocket application and its in-memory peer registry.
  *
+ * Sets up a complete websocket server with:
+ * - Peer authentication and lifecycle management
+ * - Module registration and discovery (registry sync)
+ * - Consumer-based event routing for load distribution
+ * - Health checking with automatic peer removal on timeout
+ * - Event routing with optional policy-based filtering
+ * - Heartbeat monitoring for liveness detection
+ *
  * Use when:
  * - Embedding the AIRI websocket runtime inside a server process
  * - Spinning up a testable application instance before binding a socket listener
  *
  * Expects:
  * - Caller lifecycle management to invoke `dispose` when the app is no longer needed
+ * - Auth token (if provided) must be validated for all clients
+ * - Routing middleware should be stateless and idempotent
  *
  * Returns:
- * - The H3 app plus cleanup helpers for peer shutdown and timer disposal
+ * - The H3 app at `/ws` endpoint plus cleanup helpers for peer shutdown and timer disposal
+ *
+ * Ownership:
+ * - Manages peer registry and module registry as internal mutable state
+ * - Owns all timers and intervals created during setup
+ * - Consumer orchestrator state is isolated within this function scope
  */
 export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => void, dispose: () => void } {
+  // === Configuration & State Initialization ===
   const instanceId = options?.instanceId || optionOrEnv(undefined, 'SERVER_INSTANCE_ID', nanoid())
   const authToken = optionOrEnv(options?.auth?.token, 'AUTHENTICATION_TOKEN', '')
 
@@ -246,9 +283,10 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
     onError: error => appLogger.withError(error).error('an error occurred'),
   })
 
+  // === Registries & Orchestrators ===
   const peerStore = createServerWsPeerStore<AuthenticatedPeer>()
   const peers = peerStore.peers
-  const peersByModule = new Map<string, Map<number | undefined, AuthenticatedPeer>>()
+  const peersByModule = new Map<string, Map<number | string | undefined, AuthenticatedPeer>>()
   const consumers = createConsumerOrchestrator()
   const heartbeatTtlMs = options?.heartbeat?.readTimeout ?? serverWsDefaultHeartbeatTtlMs
   const heartbeatMessage = options?.heartbeat?.message ?? MessageHeartbeat.Pong
@@ -261,6 +299,7 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
   const healthCheckIntervalMs = resolveServerWsHealthCheckIntervalMs(heartbeatTtlMs)
   let disposed = false
 
+  // === Health Check & Peer Liveness ===
   function broadcastPeerHealthy(peerInfo: AuthenticatedPeer, parentId?: string) {
     if (!peerInfo.name || !peerInfo.identity) {
       return
@@ -284,7 +323,11 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
     }
   }
 
-  function resetRoutingState() {
+  function resetRoutingState(force = false) {
+    if (!force && peers.size > 0) {
+      return
+    }
+
     peers.clear()
     peersByModule.clear()
     consumers.clear()
@@ -318,15 +361,26 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
         peers.delete(id)
         unregisterModulePeer(peerInfo, 'heartbeat expired')
       }
-      else if (peerInfo.missedHeartbeats >= serverWsHealthCheckMissesUnhealthy && peerInfo.healthy !== false && peerInfo.name && peerInfo.identity) {
+      else if (peerInfo.missedHeartbeats >= serverWsHealthCheckMissesUnhealthy && peerInfo.healthy !== false) {
         // 5 consecutive misses — mark unhealthy
         peerInfo.healthy = false
         logger.withFields({ peer: id, peerName: peerInfo.name, missedHeartbeats: peerInfo.missedHeartbeats }).debug('heartbeat late, marking unhealthy')
-        broadcastToAuthenticated({
-          type: 'registry:modules:health:unhealthy',
-          data: { name: peerInfo.name, index: peerInfo.index, identity: peerInfo.identity, reason: 'heartbeat late' },
-          metadata: createEventMetadata(instanceId),
-        })
+
+        if (peerInfo.name && peerInfo.identity) {
+          broadcastToAuthenticated({
+            type: 'registry:modules:health:unhealthy',
+            data: { name: peerInfo.name, index: peerInfo.index, identity: peerInfo.identity, reason: 'heartbeat late' },
+            metadata: createEventMetadata(instanceId),
+          })
+        }
+
+        for (const module of peerInfo.extensionModules?.values() ?? []) {
+          broadcastToAuthenticated({
+            type: 'registry:modules:health:unhealthy',
+            data: { name: module.name, identity: module.identity, reason: 'heartbeat late' },
+            metadata: createEventMetadata(instanceId),
+          })
+        }
       }
     }
   }, healthCheckIntervalMs)
@@ -334,20 +388,48 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
     healthCheckInterval.unref?.()
   }
 
-  function registerModulePeer(p: AuthenticatedPeer, name: string, index?: number) {
-    if (!peersByModule.has(name)) {
-      peersByModule.set(name, new Map())
+  // === Module Registry & Consumer Management ===
+  function registerExtensionModulePeer(p: AuthenticatedPeer, module: RegisteredExtensionModule) {
+    p.extensionModules ??= new Map()
+    const previous = p.extensionModules.get(module.identity.id)
+    if (previous && previous.name !== module.name) {
+      unregisterExtensionModuleRegistration(p, previous, 'reannounced')
     }
 
-    const group = peersByModule.get(name)!
-    if (group.has(index)) {
-      // log instead of silent overwrite
-      logger.withFields({ name, index }).debug('peer replaced for module')
+    p.extensionModules.set(module.identity.id, module)
+
+    if (!peersByModule.has(module.name)) {
+      peersByModule.set(module.name, new Map())
     }
 
+    peersByModule.get(module.name)!.set(module.identity.id, p)
     p.healthy = true
-    group.set(index, p)
     broadcastRegistrySync()
+  }
+
+  function findModulePeer(moduleName: string, moduleIndex: number | undefined, identity?: MetadataEventSource) {
+    if (isExtensionModuleIdentity(identity)) {
+      return peersByModule.get(moduleName)?.get(identity.id)
+    }
+
+    // REVIEW: This keeps legacy indexed websocket module routing while extension modules move to identity keys.
+    if (typeof moduleIndex !== 'undefined') {
+      return peersByModule.get(moduleName)?.get(moduleIndex)
+    }
+
+    const group = peersByModule.get(moduleName)
+    if (!group) {
+      return undefined
+    }
+
+    // REVIEW: This preserves the old unindexed module bucket until server module routing is fully identity-based.
+    const legacyPeer = group.get(undefined)
+    if (legacyPeer) {
+      return legacyPeer
+    }
+
+    const peers = [...group.values()]
+    return peers.length === 1 ? peers[0] : undefined
   }
 
   function registerConsumer(peerId: string, event: string, mode: ReturnType<typeof normalizeConsumerMode>, group?: string, priority?: number) {
@@ -411,11 +493,11 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
       }
     }
 
-    // broadcast module:de-announced to all authenticated peers
+    // broadcast extension:module:de-announced to all authenticated peers
     if (peerInfo.identity) {
       broadcastToAuthenticated({
-        type: 'module:de-announced',
-        data: { name: peerInfo.name, index: peerInfo.index, identity: peerInfo.identity, reason: options?.reason },
+        type: 'extension:module:de-announced',
+        data: { name: peerInfo.name, identity: peerInfo.identity, possibleEvents: [], reason: options?.reason },
         metadata: createEventMetadata(instanceId),
       })
     }
@@ -426,20 +508,83 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
     broadcastRegistrySync()
   }
 
+  function unregisterExtensionModuleRegistration(
+    peerInfo: AuthenticatedPeer,
+    module: RegisteredExtensionModule,
+    reason?: string,
+  ) {
+    const group = peersByModule.get(module.name)
+    if (group?.get(module.identity.id) === peerInfo) {
+      group.delete(module.identity.id)
+
+      if (group.size === 0) {
+        peersByModule.delete(module.name)
+      }
+    }
+
+    peerInfo.extensionModules?.delete(module.identity.id)
+    broadcastToAuthenticated({
+      type: 'extension:module:de-announced',
+      data: { name: module.name, identity: module.identity, possibleEvents: [], reason },
+      metadata: createEventMetadata(instanceId),
+    })
+  }
+
+  function unregisterExtensionModuleRegistrations(peerInfo: AuthenticatedPeer, reason?: string) {
+    if (!peerInfo.extensionModules?.size) {
+      return
+    }
+
+    for (const module of Array.from(peerInfo.extensionModules.values())) {
+      unregisterExtensionModuleRegistration(peerInfo, module, reason)
+    }
+
+    peerInfo.extensionModules.clear()
+    broadcastRegistrySync()
+  }
+
   function unregisterModulePeer(peerInfo: AuthenticatedPeer, reason?: string) {
     unregisterModuleRegistration(peerInfo, { reason })
+    unregisterExtensionModuleRegistrations(peerInfo, reason)
   }
 
   function listKnownModules() {
-    return Array.from(peers.values())
+    const legacyModules = Array.from(peers.values())
       .filter(peerInfo => peerInfo.name && peerInfo.identity)
       .map(peerInfo => ({
         name: peerInfo.name,
         index: peerInfo.index,
         identity: peerInfo.identity!,
       }))
+
+    const extensionModules = Array.from(peers.values()).flatMap(peerInfo =>
+      Array.from(peerInfo.extensionModules?.values() ?? []).map(module => ({
+        name: module.name,
+        identity: module.identity,
+      })),
+    )
+
+    return [...legacyModules, ...extensionModules]
   }
 
+  function isExtensionIdentity(value: unknown): value is ExtensionIdentity {
+    return Boolean(
+      value
+      && typeof value === 'object'
+      && typeof (value as Partial<ExtensionIdentity>).id === 'string',
+    )
+  }
+
+  function isExtensionModuleIdentity(value: unknown): value is ExtensionModuleIdentity {
+    return Boolean(
+      value
+      && typeof value === 'object'
+      && typeof (value as Partial<ExtensionModuleIdentity>).id === 'string'
+      && isExtensionIdentity((value as Partial<ExtensionModuleIdentity>).extension),
+    )
+  }
+
+  // === Broadcasting & Registry Synchronization ===
   function sendRegistrySync(peer: Peer, parentId?: string) {
     send(peer, {
       type: 'registry:modules:sync',
@@ -464,6 +609,8 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
     }
   }
 
+  // === WebSocket Gateway Handler ===
+  // Handles peer lifecycle: open, message, error, close
   const websocketGateway = createGateway({
     handler: {
       open: (peer) => {
@@ -521,7 +668,7 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
         if (authenticatedPeer) {
           markPeerAlive(authenticatedPeer, { parentId: event.metadata?.event.id })
 
-          if (authenticatedPeer.authenticated && event.metadata?.source) {
+          if (authenticatedPeer.authenticated && isExtensionModuleIdentity(event.metadata?.source)) {
             authenticatedPeer.identity = event.metadata.source
           }
         }
@@ -565,56 +712,135 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
             return
           }
 
-          case 'module:announce': {
+          case 'peer:authenticate': {
+            const clientToken = typeof event.data.token === 'string' ? event.data.token : ''
+            if (authToken && !timingSafeCompare(clientToken, authToken)) {
+              logger.withFields({ peer: peer.id, peerRemote: peer.remoteAddress, peerRequest: peer.request?.url }).log('peer authentication failed')
+              send(peer, RESPONSES.error(ServerErrorMessages.invalidToken, event.metadata?.event.id))
+
+              return
+            }
+
+            const authenticatedPeerId = event.data.peerId ?? peer.id
+            send(peer, RESPONSES.peerAuthenticated(authenticatedPeerId, event.metadata?.event.id))
+            const p = peers.get(peer.id)
+            if (p) {
+              p.authenticated = true
+              p.peerIds ??= new Set()
+              p.peerIds.add(peer.id)
+              p.peerIds.add(authenticatedPeerId)
+            }
+
+            sendRegistrySync(peer, event.metadata?.event.id)
+
+            return
+          }
+
+          case 'extension:authenticate': {
+            const clientToken = typeof event.data.token === 'string' ? event.data.token : ''
+            if (authToken && !timingSafeCompare(clientToken, authToken)) {
+              logger.withFields({ peer: peer.id, peerRemote: peer.remoteAddress, peerRequest: peer.request?.url }).log('extension authentication failed')
+              send(peer, RESPONSES.error(ServerErrorMessages.invalidToken, event.metadata?.event.id))
+
+              return
+            }
+
+            const p = peers.get(peer.id)
+            if (p) {
+              p.authenticated = true
+              p.extensionIdentity = event.data.identity
+            }
+
+            send(peer, RESPONSES.extensionAuthenticated(event.data.identity, event.metadata?.event.id))
+            sendRegistrySync(peer, event.metadata?.event.id)
+
+            return
+          }
+
+          case 'extension:announce': {
             const p = peers.get(peer.id)
             if (!p) {
               return
             }
 
-            const { name, index, identity } = event.data as { name: string, index?: number, identity?: MetadataEventSource }
-            if (!name || typeof name !== 'string') {
-              send(peer, RESPONSES.error(ServerErrorMessages.moduleAnnounceNameInvalid))
-
-              return
-            }
-            if (typeof index !== 'undefined') {
-              if (!Number.isInteger(index) || index < 0) {
-                send(peer, RESPONSES.error(ServerErrorMessages.moduleAnnounceIndexInvalid))
-
-                return
-              }
-            }
-            if (!identity || identity.kind !== 'plugin' || !identity.plugin?.id) {
-              send(peer, RESPONSES.error(ServerErrorMessages.moduleAnnounceIdentityInvalid))
-
-              return
-            }
             if (authToken && !p.authenticated) {
               send(peer, RESPONSES.error(ServerErrorMessages.mustAuthenticateBeforeAnnouncing))
 
               return
             }
 
-            unregisterModuleRegistration(p, {
-              reason: 're-announcing',
-              unregisterConsumers: false,
+            if (!isExtensionIdentity(event.data.identity)) {
+              send(peer, RESPONSES.error(ServerErrorMessages.moduleAnnounceIdentityInvalid))
+
+              return
+            }
+
+            p.extensionIdentity = event.data.identity
+
+            send(peer, {
+              type: 'extension:announced',
+              data: event.data,
+              metadata: createEventMetadata(instanceId, event.metadata?.event.id),
             })
 
-            p.name = name
-            p.index = index
-            p.identity = identity
-
-            registerModulePeer(p, name, index)
-
-            // broadcast module:announced to all authenticated peers
             for (const other of peers.values()) {
-            // only send to
-            // 1. authenticated peers
-            // 2. other peers except the announcing peer itself
               if (other.authenticated && !(other.peer.id === peer.id)) {
                 send(other.peer, {
-                  type: 'module:announced',
-                  data: { name, index, identity },
+                  type: 'extension:announced',
+                  data: event.data,
+                  metadata: createEventMetadata(instanceId, event.metadata?.event.id),
+                })
+              }
+            }
+
+            return
+          }
+
+          case 'extension:module:announce': {
+            const p = peers.get(peer.id)
+            if (!p) {
+              return
+            }
+
+            if (authToken && !p.authenticated) {
+              send(peer, RESPONSES.error(ServerErrorMessages.mustAuthenticateBeforeAnnouncing))
+
+              return
+            }
+
+            const { name, identity } = event.data
+            if (!name || typeof name !== 'string') {
+              send(peer, RESPONSES.error(ServerErrorMessages.moduleAnnounceNameInvalid))
+
+              return
+            }
+
+            if (!isExtensionModuleIdentity(identity)) {
+              send(peer, RESPONSES.error(ServerErrorMessages.moduleAnnounceIdentityInvalid))
+
+              return
+            }
+
+            if (p.extensionIdentity && identity.extension.id !== p.extensionIdentity.id) {
+              send(peer, RESPONSES.error(ServerErrorMessages.moduleAnnounceIdentityInvalid))
+
+              return
+            }
+
+            p.extensionIdentity = identity.extension
+            registerExtensionModulePeer(p, { name, identity })
+
+            send(peer, {
+              type: 'extension:module:announced',
+              data: event.data,
+              metadata: createEventMetadata(instanceId, event.metadata?.event.id),
+            })
+
+            for (const other of peers.values()) {
+              if (other.authenticated && !(other.peer.id === peer.id)) {
+                send(other.peer, {
+                  type: 'extension:module:announced',
+                  data: event.data,
                   metadata: createEventMetadata(instanceId, event.metadata?.event.id),
                 })
               }
@@ -630,7 +856,7 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
               identity?: MetadataEventSource
               config?: Record<string, unknown>
             }
-            const moduleName = data.moduleName ?? data.identity?.plugin?.id ?? ''
+            const moduleName = data.moduleName ?? (isExtensionModuleIdentity(data.identity) ? data.identity.id : '') ?? ''
             const moduleIndex = data.moduleIndex
             const config = data.config
 
@@ -647,7 +873,7 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
               }
             }
 
-            const target = peersByModule.get(moduleName)?.get(moduleIndex)
+            const target = findModulePeer(moduleName, moduleIndex, data.identity)
             if (target) {
               send(target.peer, {
                 type: 'module:configure',
@@ -873,7 +1099,7 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
     dispose: () => {
       clearInterval(healthCheckInterval)
       closeAllPeers()
-      resetRoutingState()
+      resetRoutingState(true)
     },
   })
 
@@ -881,13 +1107,46 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
 
   function closeAllPeers() {
     logger.withFields({ totalPeers: peers.size }).log('closing all peers')
-    for (const peer of Array.from(peers.values())) {
-      logger.withFields({ peer: peer.peer.id, peerName: peer.name }).debug('closing peer')
+
+    for (const peerInfo of Array.from(peers.values())) {
+      logger.withFields({
+        peer: peerInfo.peer.id,
+        peerName: peerInfo.name,
+      }).debug('closing peer')
+
       try {
-        peer.peer.close?.()
+        peerInfo.peer.close?.()
       }
       catch (error) {
-        logger.withFields({ peer: peer.peer.id, peerName: peer.name }).withError(error as Error).debug('failed to close peer during shutdown')
+        logger
+          .withFields({
+            peer: peerInfo.peer.id,
+            peerName: peerInfo.name,
+          })
+          .withError(error as Error)
+          .debug('failed to close peer during shutdown')
+
+        // Leave the peer registered until forced disposal cleanup.
+        continue
+      }
+
+      // Some websocket runtimes may never emit `close`
+      // during abrupt shutdown sequences. Remove peers
+      // synchronously after initiating a successful close
+      // so shutdown cleanup is deterministic.
+      peers.delete(peerInfo.peer.id)
+
+      try {
+        unregisterModulePeer(peerInfo, 'server shutdown')
+      }
+      catch (error) {
+        logger
+          .withFields({
+            peer: peerInfo.peer.id,
+            peerName: peerInfo.name,
+          })
+          .withError(error as Error)
+          .debug('failed to unregister peer during shutdown')
       }
     }
   }
