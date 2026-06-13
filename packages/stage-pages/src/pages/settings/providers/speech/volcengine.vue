@@ -40,6 +40,8 @@ const resourceId = computed({
   set: (v) => {
     if (!providers.value[providerId])
       providers.value[providerId] = {}
+    if (!providers.value[providerId].app)
+      providers.value[providerId].app = {}
     ;(providers.value[providerId].app as Record<string, unknown>).resource_id = v
   },
 })
@@ -49,6 +51,8 @@ const speaker = computed({
   set: (v) => {
     if (!providers.value[providerId])
       providers.value[providerId] = {}
+    if (!providers.value[providerId].app)
+      providers.value[providerId].app = {}
     ;(providers.value[providerId].app as Record<string, unknown>).speaker = v
   },
 })
