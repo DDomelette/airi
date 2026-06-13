@@ -250,6 +250,7 @@ watch([providers, resourceId, speaker], async () => {
         :available-voices="availableVoices"
         :generate-speech="handleGenerateSpeech"
         :api-key-configured="apiKeyConfigured"
+        :preferred-voice="speaker"
         default-text="你好！这是一段火山引擎语音合成测试。"
       />
     </template>
