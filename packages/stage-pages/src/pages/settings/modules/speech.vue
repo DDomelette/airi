@@ -88,6 +88,15 @@ function formatCostMultiplier(multiplier: number) {
   return `${Number.isInteger(multiplier) ? multiplier : multiplier.toFixed(2).replace(/\.?0+$/, '')}x`
 }
 
+// Sync voice from provider config for any provider that stores `voice` field
+function syncProviderVoiceFromConfig() {
+  const providerConfig = providersStore.getProviderConfig(activeSpeechProvider.value)
+  if (providerConfig?.voice) {
+    activeSpeechVoiceId.value = providerConfig.voice as string
+    updateCustomVoiceName(providerConfig.voice as string)
+  }
+}
+
 // Sync OpenAI Compatible model and voice from provider config
 function syncOpenAICompatibleSettings() {
   if (activeSpeechProvider.value !== 'openai-compatible-audio-speech')
@@ -121,6 +130,7 @@ onMounted(async () => {
   speechStore.ensureActiveSpeechModel()
   await speechStore.loadVoicesForProvider(activeSpeechProvider.value, activeSpeechModel.value || undefined)
   syncOpenAICompatibleSettings()
+  syncProviderVoiceFromConfig()
 })
 
 async function bindVoicePack(pack: (typeof voicePacks.value)[number]) {
@@ -147,11 +157,23 @@ watch(activeSpeechProvider, async (newProvider, oldProvider) => {
   await speechStore.loadVoicesForProvider(newProvider, activeSpeechModel.value || undefined)
 
   syncOpenAICompatibleSettings()
+  syncProviderVoiceFromConfig()
 })
 
 watch(activeSpeechModel, async () => {
   if (activeSpeechProvider.value) {
     await speechStore.loadVoicesForProvider(activeSpeechProvider.value, activeSpeechModel.value || undefined)
+  }
+})
+
+// React to voice config changes (e.g. volcengine speaker set on provider page)
+const activeProviderVoiceConfig = computed(() => {
+  return providersStore.getProviderConfig(activeSpeechProvider.value)?.voice as string | undefined
+})
+watch(activeProviderVoiceConfig, (newVoice) => {
+  if (newVoice && activeSpeechVoiceId.value !== newVoice) {
+    activeSpeechVoiceId.value = newVoice
+    updateCustomVoiceName(newVoice)
   }
 })
 
