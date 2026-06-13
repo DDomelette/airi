@@ -125,16 +125,17 @@ async function handleGenerateSpeech(input: string, voiceId: string, _useSSML: bo
   }
 
   const providerConfig = providersStore.getProviderConfig(providerId)
-
-  const model = providerConfig.model as string | undefined || defaultModel
+  const app = (providerConfig.app ?? {}) as Record<string, unknown>
 
   return await speechStore.speech(
     provider,
-    model,
+    defaultModel,
     input,
     voiceId,
     {
-      ...providerConfig,
+      resourceId: app.resource_id as string | undefined,
+      audio: app.audio as UnVolcengineOptions['audio'] | undefined,
+      app,
     },
   )
 }
