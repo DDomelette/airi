@@ -135,7 +135,6 @@ async function handleGenerateSpeech(input: string, voiceId: string, _useSSML: bo
     {
       resourceId: app.resource_id as string | undefined,
       audio: app.audio as UnVolcengineOptions['audio'] | undefined,
-      app,
     },
   )
 }
